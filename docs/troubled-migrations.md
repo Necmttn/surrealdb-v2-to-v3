@@ -458,17 +458,15 @@ v2 codebases commonly used string interpolation for dynamic queries. When migrat
 
 **Real production code (BEFORE - vulnerable):**
 ```typescript
-const updateDocumentStatus = (documentId: string, status: string, error?: string) => {
-    let query = `
-        UPDATE ${documentId} SET
-            processing_status = '${status}',
-            updated_at = time::now()
-    `;
-    if (error) {
-        query += `, error_message = '${error.replace(/'/g, "''")}'`;
-    }
-    yield* db.query(query).raw();
-};
+let query = `
+    UPDATE ${documentId} SET
+        processing_status = '${status}',
+        updated_at = time::now()
+`;
+if (error) {
+    query += `, error_message = '${error.replace(/'/g, "''")}'`;
+}
+await db.query(query);
 ```
 
 This breaks when:
@@ -478,15 +476,13 @@ This breaks when:
 
 **AFTER (parameterized):**
 ```typescript
-const updateDocumentStatus = (documentId: string, status: string, error?: string) => {
-    const params: Record<string, unknown> = { docId: documentId, status };
-    let query = `UPDATE type::record($docId) SET processing_status = $status, updated_at = time::now()`;
-    if (error) {
-        query += `, error_message = $error`;
-        params.error = error;
-    }
-    yield* db.query(query, params).raw();
-};
+const params: Record<string, unknown> = { docId: documentId, status };
+let query = `UPDATE type::record($docId) SET processing_status = $status, updated_at = time::now()`;
+if (error) {
+    query += `, error_message = $error`;
+    params.error = error;
+}
+await db.query(query, params);
 ```
 
 ### Migration Checklist
@@ -514,7 +510,7 @@ const vals = relations
         `{ in: ${ridToSurql(rel.in)}, out: ${ridToSurql(rel.out)}, order: ${rel.order} }`
     )
     .join(", ");
-yield* db.query(`INSERT RELATION INTO contains [${vals}]`).raw();
+await db.query(`INSERT RELATION INTO contains [${vals}]`);
 ```
 
 This worked but was verbose, error-prone, and bypassed CBOR parameterization.
@@ -532,7 +528,7 @@ const relations = [
     { in: new RecordId("document", "doc1"), out: compoundBlockId("doc1", "/page/1"), order: 1 },
 ];
 
-yield* db.query(surql`INSERT RELATION INTO contains ${relations}`).raw();
+await db.query(surql`INSERT RELATION INTO contains ${relations}`).collect();
 ```
 
 ### What Works Natively via CBOR (Proven by Integration Tests)
@@ -603,36 +599,37 @@ console.log(typeof person.id);
 
 ### Why This Breaks
 
-If your Effect/Zod/Schema validation expects `id` to be a `string`, `.raw()` silently passes a RecordId object that looks like a string but isn't:
+If your validation logic (Zod, io-ts, Effect Schema, etc.) expects `id` to be a `string`, `.raw()` silently passes a RecordId object that looks like a string but isn't:
 
 ```typescript
-// Schema expects string IDs
-const PersonSchema = Schema.Struct({
-    id: Schema.String,  // expects string
-    name: Schema.String,
-});
-
-// .raw() + Schema.decodeUnknown = FAILS
-// RecordId object doesn't match Schema.String
+// .raw() + any string validation = FAILS
 const [person] = await db.query("SELECT * FROM person:alice").raw();
-Schema.decodeUnknownSync(PersonSchema)(person); // ERROR!
+typeof person.id // => "object" (RecordId), not "string"
 
-// .json() + Schema.decodeUnknown = WORKS
+// .json() + string validation = WORKS
 const [person] = await db.query("SELECT * FROM person:alice").json();
-Schema.decodeUnknownSync(PersonSchema)(person); // OK - id is "person:alice"
+typeof person.id // => "string" ("person:alice")
 ```
 
 ### The Fix
 
-Use `.json()` when your schemas expect string IDs, `.raw()` when you need RecordId objects for subsequent queries:
+Use `.collect()` + `jsonify()` or `.json()` when you need plain JS objects with string IDs. Use `.raw()` when you need RecordId objects for passing back into subsequent queries:
 
 ```typescript
-// For schema validation: use .json() or .jsonDecode()
-const [person] = yield* db.query("SELECT * FROM ONLY person:alice").jsonDecode([PersonSchema]);
+import { jsonify } from "surrealdb";
 
-// For passing IDs back into queries: use .raw()
-const [person] = yield* db.query("SELECT * FROM ONLY person:alice").raw();
-yield* db.query("UPDATE $id SET ...", { id: person.id }); // RecordId works as param
+// For serialization / validation: use .json() - stringifies RecordIds
+const results = await db.query("SELECT * FROM person").json();
+// results[0].id = "person:alice" (string)
+
+// For passing IDs back into queries: use .raw() or .collect()
+const results = await db.query("SELECT * FROM person").collect();
+// results[0].id = RecordId { table: "person", id: "alice" }
+await db.query("UPDATE $id SET age = 31", { id: results[0].id }); // works
+
+// Manual conversion when needed
+const raw = await db.query("SELECT * FROM ONLY person:alice").collect();
+const plain = jsonify(raw[0]); // converts RecordIds to strings recursively
 ```
 
 ---

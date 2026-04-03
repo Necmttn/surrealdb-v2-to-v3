@@ -378,19 +378,23 @@ db.query(`UPDATE type::record($docId) SET status = $status`, { docId, status });
 
 Scan for interpolation in queries: `rg '\$\{.*\}' --type ts -C2 | rg -i 'query|surql|UPDATE|SELECT'`
 
-### `.raw()` vs `.json()` - Know Which to Use
+### `.collect()` vs `.json()` - Know Which to Use
 
 ```typescript
-// .raw() returns RecordId objects - use for passing IDs into subsequent queries
-const [record] = await db.query("SELECT * FROM ONLY person:alice").raw();
-await db.query("UPDATE $id SET ...", { id: record.id }); // RecordId works as param
+import { jsonify } from "surrealdb";
 
-// .json() returns string IDs - use for schema validation / serialization
-const [record] = await db.query("SELECT * FROM ONLY person:alice").json();
-// record.id = "person:alice" (string) - works with Schema.String
+// .collect() returns RecordId objects - use for passing IDs into subsequent queries
+const results = await db.query("SELECT * FROM person").collect();
+typeof results[0].id // => "object" (RecordId)
+await db.query("UPDATE $id SET age = 31", { id: results[0].id }); // works
 
-// .jsonDecode() combines .json() + Schema validation in one call
-const [person] = await db.query("SELECT * FROM ONLY person:alice").jsonDecode([PersonSchema]);
+// .json() returns string IDs - use for serialization / validation
+const results = await db.query("SELECT * FROM person").json();
+typeof results[0].id // => "string" ("person:alice")
+
+// Manual conversion when needed
+const raw = await db.query("SELECT * FROM ONLY person:alice").collect();
+const plain = jsonify(raw[0]); // converts RecordIds to strings recursively
 ```
 
 ### Transactions: Use RETURN
@@ -419,7 +423,7 @@ const [doc] = await db.query(`
 
 4. **Parameterized record IDs**: String params like `$docId` aren't auto-cast to record IDs. Use `type::record('table', $id)` explicitly.
 
-5. **`.raw()` returns RecordId objects**: When using `.raw()` queries, record IDs come back as RecordId objects, not strings. Use `.json()` or `.jsonDecode()` when schemas expect strings.
+5. **`.collect()` returns RecordId objects**: Query results via `.collect()` return RecordId objects, not strings. Use `.json()` or `jsonify()` when you need plain string IDs for serialization or validation.
 
 6. **DDL doesn't support params**: `DEFINE USER`, `REMOVE USER` etc. don't support `$param` syntax. Use string interpolation (safe when values are self-generated).
 
@@ -435,7 +439,7 @@ const [doc] = await db.query(`
 4. **"Update my SDK code"**: Walk through the SDK v1-to-v2 changes section and post-migration patterns.
 5. **"What changed in v3?"**: Reference the breaking changes and benchmarks sections.
 6. **"My relations are broken"**: Check for StringRecordId usage, recommend `surql` tag or `db.insert().relation()`.
-7. **"Schema validation fails after upgrade"**: Check `.raw()` vs `.json()` - probably returning RecordId objects where strings are expected.
+7. **"My IDs are objects not strings"**: Check `.collect()` vs `.json()` - probably returning RecordId objects where strings are expected. Use `jsonify()` to convert.
 
 If the user provides a backup file path or schema directory as an argument, start by scanning it for v2 patterns and providing a concrete migration plan.
 
