@@ -1,0 +1,21 @@
+{
+  "name": "surrealdb-v2-to-v3",
+  "version": "1.0.0",
+  "description": "SurrealDB v2 to v3 migration toolkit with custom SurQL parser, backup restore, and Claude Code skill",
+  "type": "module",
+  "scripts": {
+    "migrate": "bun run scripts/surrealdb-migrate.ts",
+    "restore": "bun run scripts/surrealdb-restore-sdk.ts"
+  },
+  "dependencies": {
+    "surrealdb": "^2.0.3"
+  },
+  "keywords": [
+    "surrealdb",
+    "migration",
+    "v2-to-v3",
+    "database",
+    "claude-code-skill"
+  ],
+  "license": "MIT"
+}

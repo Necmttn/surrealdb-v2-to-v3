@@ -1,0 +1,10 @@
+{
+  "name": "surrealdb-v2-to-v3",
+  "description": "Complete SurrealDB v2 to v3 migration toolkit - custom SurQL parser, schema transformer, backup restore, and migration playbook",
+  "version": "1.0.0",
+  "author": {
+    "name": "necmttn"
+  },
+  "repository": "https://github.com/necmttn/surrealdb-v2-to-v3",
+  "license": "MIT"
+}

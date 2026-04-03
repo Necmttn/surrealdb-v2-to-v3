@@ -1,0 +1,4 @@
+node_modules/
+*.checkpoint.json
+.env
+.env.local
