@@ -322,6 +322,93 @@ Based on real-world migration of a production database (119,962 records):
 - Compound array record IDs rejected by HTTP parser
 - SDK v1 `auth` option silently ignored (no authentication)
 
+## Post-Migration: Preferred Patterns for New Code
+
+After migrating, use these patterns for all new SurrealDB code:
+
+### Use `surql` Tag Instead of String Building
+
+```typescript
+import { surql, Table, RecordId } from "surrealdb";
+
+// PREFERRED - surql tag auto-parameterizes via CBOR
+const blockRid = new RecordId("block", [new RecordId("document", "abc"), "/page/0"]);
+await db.query(surql`SELECT * FROM block WHERE id = ${blockRid}`).collect();
+
+// PREFERRED - bulk relation insert via CBOR
+const rels = [
+    { in: docRid, out: block1, order: 0 },
+    { in: docRid, out: block2, order: 1 },
+];
+await db.query(surql`INSERT RELATION INTO contains ${rels}`).raw();
+
+// ALSO WORKS - db.insert().relation() for typed inserts
+await db.insert(new Table("contains"), rels).relation();
+
+// ALSO WORKS - db.relate() for single edges
+await db.relate(block1, new Table("hierarchy"), block2, { level: 1 });
+```
+
+### Eliminate StringRecordId
+
+`StringRecordId` is a legacy workaround. Replace all usage:
+
+```typescript
+// BAD - StringRecordId rejected by v3 for compound IDs
+import { StringRecordId } from "surrealdb";
+const id = new StringRecordId(blockIdStr);
+
+// GOOD - RecordId for simple IDs
+import { RecordId } from "surrealdb";
+const id = new RecordId("document", "abc123");
+
+// GOOD - RecordId for compound IDs
+const id = new RecordId("block", [new RecordId("document", "abc"), "/page/0"]);
+```
+
+### Parameterize All Queries (Audit for Injection)
+
+```typescript
+// BAD - string interpolation (injection risk + breaks on special chars)
+db.query(`UPDATE ${documentId} SET status = '${status}'`);
+
+// GOOD - parameterized
+db.query(`UPDATE type::record($docId) SET status = $status`, { docId, status });
+```
+
+Scan for interpolation in queries: `rg '\$\{.*\}' --type ts -C2 | rg -i 'query|surql|UPDATE|SELECT'`
+
+### `.raw()` vs `.json()` - Know Which to Use
+
+```typescript
+// .raw() returns RecordId objects - use for passing IDs into subsequent queries
+const [record] = await db.query("SELECT * FROM ONLY person:alice").raw();
+await db.query("UPDATE $id SET ...", { id: record.id }); // RecordId works as param
+
+// .json() returns string IDs - use for schema validation / serialization
+const [record] = await db.query("SELECT * FROM ONLY person:alice").json();
+// record.id = "person:alice" (string) - works with Schema.String
+
+// .jsonDecode() combines .json() + Schema validation in one call
+const [person] = await db.query("SELECT * FROM ONLY person:alice").jsonDecode([PersonSchema]);
+```
+
+### Transactions: Use RETURN
+
+```typescript
+// WITH RETURN - produces exactly one result slot (safe to destructure)
+const [doc] = await db.query(`
+    BEGIN TRANSACTION;
+    LET $doc = CREATE ONLY document CONTENT { name: 'test' };
+    UPDATE $doc SET processed = true;
+    RETURN $doc;
+    COMMIT TRANSACTION;
+`).collect();
+
+// WITHOUT RETURN - one slot per statement (ambiguous, avoid)
+// Break into separate db.query() calls instead
+```
+
 ## Common Gotchas
 
 1. **`null` vs omitting fields**: SurrealDB v3 rejects `null` for `option<T>` fields - omit the field entirely instead of passing `null`.
@@ -332,16 +419,24 @@ Based on real-world migration of a production database (119,962 records):
 
 4. **Parameterized record IDs**: String params like `$docId` aren't auto-cast to record IDs. Use `type::record('table', $id)` explicitly.
 
-5. **`.raw()` returns RecordId objects**: When using `.raw()` queries, record IDs come back as RecordId objects, not strings. Always `String()` before string operations.
+5. **`.raw()` returns RecordId objects**: When using `.raw()` queries, record IDs come back as RecordId objects, not strings. Use `.json()` or `.jsonDecode()` when schemas expect strings.
 
 6. **DDL doesn't support params**: `DEFINE USER`, `REMOVE USER` etc. don't support `$param` syntax. Use string interpolation (safe when values are self-generated).
+
+7. **`renewAccess` doesn't exist in SDK v2**: Despite blog mentions, the option is not in the type definitions. It silently does nothing via type cast.
+
+8. **`BoundQuery.toString()` returns `[object Object]`**: Access `.query` property for the SQL string, don't use `String(boundQuery)`.
 
 ## When the User Asks for Help
 
 1. **"Migrate my database"**: Walk through the full playbook above, starting with Phase 1 assessment.
 2. **"Fix my queries"**: Scan their code for v2 patterns using the transformation tables above.
 3. **"My import is failing"**: Recommend the custom migration script over `surreal import`.
-4. **"Update my SDK code"**: Walk through the SDK v1-to-v2 changes section.
+4. **"Update my SDK code"**: Walk through the SDK v1-to-v2 changes section and post-migration patterns.
 5. **"What changed in v3?"**: Reference the breaking changes and benchmarks sections.
+6. **"My relations are broken"**: Check for StringRecordId usage, recommend `surql` tag or `db.insert().relation()`.
+7. **"Schema validation fails after upgrade"**: Check `.raw()` vs `.json()` - probably returning RecordId objects where strings are expected.
 
 If the user provides a backup file path or schema directory as an argument, start by scanning it for v2 patterns and providing a concrete migration plan.
+
+For the full catalog of real-world failure cases with code examples, see [docs/troubled-migrations.md](../../docs/troubled-migrations.md).

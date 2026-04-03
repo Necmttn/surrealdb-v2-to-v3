@@ -450,6 +450,233 @@ ridToSurql(new RecordId("block", [new RecordId("document", "abc"), "/page/0/Text
 
 ---
 
+## 8. SQL Injection Vulnerability During Migration
+
+### The Problem
+
+v2 codebases commonly used string interpolation for dynamic queries. When migrating to v3, these become injection vectors and also break on special characters in status messages or error strings.
+
+**Real production code (BEFORE - vulnerable):**
+```typescript
+const updateDocumentStatus = (documentId: string, status: string, error?: string) => {
+    let query = `
+        UPDATE ${documentId} SET
+            processing_status = '${status}',
+            updated_at = time::now()
+    `;
+    if (error) {
+        query += `, error_message = '${error.replace(/'/g, "''")}'`;
+    }
+    yield* db.query(query).raw();
+};
+```
+
+This breaks when:
+- `error` contains single quotes, backslashes, or SurrealQL syntax
+- `documentId` could be manipulated (though usually self-generated)
+- Manual quote escaping (`replace(/'/g, "''")`) is fragile
+
+**AFTER (parameterized):**
+```typescript
+const updateDocumentStatus = (documentId: string, status: string, error?: string) => {
+    const params: Record<string, unknown> = { docId: documentId, status };
+    let query = `UPDATE type::record($docId) SET processing_status = $status, updated_at = time::now()`;
+    if (error) {
+        query += `, error_message = $error`;
+        params.error = error;
+    }
+    yield* db.query(query, params).raw();
+};
+```
+
+### Migration Checklist
+
+When upgrading to v3, audit all queries for string interpolation:
+```bash
+# Find string interpolation in SurrealQL queries
+rg '\$\{.*\}' --type ts -C2 | rg -i 'query|surql|UPDATE|SELECT|DELETE|CREATE'
+```
+
+Replace all `${variable}` in query strings with `$param` + params object.
+
+---
+
+## 9. The `surql` Tag Solution: Eliminating String Building Entirely
+
+### The Problem
+
+After discovering compound RecordId issues (#5, #7), the initial fix used `ridToSurql()` to build SurrealQL strings manually for relation inserts:
+
+```typescript
+// Initial workaround - manual string building with ridToSurql()
+const vals = relations
+    .map(rel =>
+        `{ in: ${ridToSurql(rel.in)}, out: ${ridToSurql(rel.out)}, order: ${rel.order} }`
+    )
+    .join(", ");
+yield* db.query(`INSERT RELATION INTO contains [${vals}]`).raw();
+```
+
+This worked but was verbose, error-prone, and bypassed CBOR parameterization.
+
+### The Fix: SDK v2's `surql` Tagged Template
+
+SDK v2 provides a `surql` tagged template literal that auto-parameterizes interpolated values via CBOR - including compound RecordIds:
+
+```typescript
+import { surql, Table, RecordId } from "surrealdb";
+
+// CBOR handles compound RecordIds natively - no string building needed
+const relations = [
+    { in: new RecordId("document", "doc1"), out: compoundBlockId("doc1", "/page/0"), order: 0 },
+    { in: new RecordId("document", "doc1"), out: compoundBlockId("doc1", "/page/1"), order: 1 },
+];
+
+yield* db.query(surql`INSERT RELATION INTO contains ${relations}`).raw();
+```
+
+### What Works Natively via CBOR (Proven by Integration Tests)
+
+All of these handle compound RecordIds without any string building:
+
+```typescript
+// db.query() with RecordId param binding
+const blockRid = new RecordId("block", [new RecordId("document", "test1"), "/page/0/Text/0"]);
+await db.query(`SELECT * FROM block WHERE id = $blockId`, { blockId: blockRid }).collect();
+
+// surql tag with interpolated RecordId
+await db.query(surql`SELECT * FROM block WHERE id = ${blockRid}`).collect();
+
+// Array of compound RecordIds in IN clause
+await db.query(`SELECT * FROM block WHERE id IN $ids`, { ids: [block1, block2] }).collect();
+
+// db.insert().relation() - bulk relation inserts
+const rels = [
+    { in: docRid, out: block1, order: 0 },
+    { in: docRid, out: block2, order: 1 },
+];
+await db.insert(new Table("contains"), rels).relation();
+
+// db.relate() - single edge creation
+await db.relate(block1, new Table("hierarchy"), block2, {
+    relation_type: "section",
+    level: 1,
+});
+
+// db.update() / db.select() / db.delete() with compound IDs
+await db.update(blockRid).merge({ summary: "Test" });
+await db.select(blockRid);
+await db.delete(blockRid);
+```
+
+### Migration Path
+
+| Phase | Approach | When to Use |
+|-------|----------|------------|
+| During migration (import) | `surrealdb-migrate.ts` | Importing v2 exports |
+| Legacy code (quick fix) | `ridToSurql()` + `type::record($param)` | Minimal-change patches |
+| New code (preferred) | `surql` tag or `RecordId` objects | All new development |
+
+---
+
+## 10. The `.raw()` vs `.json()` Trap
+
+### The Problem
+
+SDK v2 returns different types depending on which method you call:
+
+```typescript
+// .raw() returns RecordId objects (CBOR-deserialized)
+const [person] = await db.query("SELECT * FROM ONLY person:alice").raw();
+console.log(person.id);
+// => RecordId { table: "person", id: "alice" }
+console.log(typeof person.id);
+// => "object"
+
+// .json() returns stringified IDs
+const [person] = await db.query("SELECT * FROM ONLY person:alice").json();
+console.log(person.id);
+// => "person:alice"
+console.log(typeof person.id);
+// => "string"
+```
+
+### Why This Breaks
+
+If your Effect/Zod/Schema validation expects `id` to be a `string`, `.raw()` silently passes a RecordId object that looks like a string but isn't:
+
+```typescript
+// Schema expects string IDs
+const PersonSchema = Schema.Struct({
+    id: Schema.String,  // expects string
+    name: Schema.String,
+});
+
+// .raw() + Schema.decodeUnknown = FAILS
+// RecordId object doesn't match Schema.String
+const [person] = await db.query("SELECT * FROM person:alice").raw();
+Schema.decodeUnknownSync(PersonSchema)(person); // ERROR!
+
+// .json() + Schema.decodeUnknown = WORKS
+const [person] = await db.query("SELECT * FROM person:alice").json();
+Schema.decodeUnknownSync(PersonSchema)(person); // OK - id is "person:alice"
+```
+
+### The Fix
+
+Use `.json()` when your schemas expect string IDs, `.raw()` when you need RecordId objects for subsequent queries:
+
+```typescript
+// For schema validation: use .json() or .jsonDecode()
+const [person] = yield* db.query("SELECT * FROM ONLY person:alice").jsonDecode([PersonSchema]);
+
+// For passing IDs back into queries: use .raw()
+const [person] = yield* db.query("SELECT * FROM ONLY person:alice").raw();
+yield* db.query("UPDATE $id SET ...", { id: person.id }); // RecordId works as param
+```
+
+---
+
+## 11. Transaction RETURN Behavior Clarification
+
+### The Corrected Understanding
+
+The original playbook (#4 above) described transactions as returning one slot per statement. This is only true for transactions **without** `RETURN`:
+
+**With RETURN (one result slot):**
+```typescript
+const [document] = await db.query(`
+    BEGIN TRANSACTION;
+    LET $note = CREATE ONLY note;
+    LET $doc = CREATE ONLY document CONTENT { name: 'test' };
+    UPDATE $note SET document = $doc.id;
+    RETURN $doc;
+    COMMIT TRANSACTION;
+`).collect();
+// document = { id: RecordId, name: "test" }
+// Only the RETURN value is output - all other statement results are suppressed
+```
+
+**Without RETURN (one slot per statement):**
+```typescript
+const results = await db.query(`
+    BEGIN TRANSACTION;
+    UPDATE person:alice SET age = 31;
+    SELECT * FROM person WHERE age > 30;
+    COMMIT TRANSACTION;
+`).collect();
+// results = [null, [{ ... }], [{ ... }], null]
+// One slot per statement - ambiguous parsing
+```
+
+### Rule of Thumb
+
+- **With RETURN**: Safe to destructure as `const [result] = db.query(...)`
+- **Without RETURN**: Avoid. Break into separate `db.query()` calls instead
+- **Never** use `.find(Array.isArray)` to extract results from transactions
+
+---
+
 ## Summary: Official Tool vs Custom Tool
 
 | Failure Case | `surreal import` | `surrealdb-migrate.ts` |
