@@ -18,6 +18,11 @@ The official `surreal export` + `surreal import` roundtrip is **broken** for mos
 2. **Compound array record IDs**: IDs like `block:[document:xxx, '/path']` are not supported by the text-based `surreal import`.
 3. **Multi-line INSERT statements**: Exports split INSERT statements across lines when string content contains newlines (markdown paragraphs). The importer can't reassemble them.
 4. **Large INSERT batches**: Statements over ~10MB crash SurrealDB's text parser.
+5. **INSERT RELATION with compound IDs**: Relation records referencing compound IDs fail both in text import and SDK parameter binding.
+6. **SDK v2 RecordId serialization mismatch**: `RecordId.toString()` produces type-prefixed format (`r"..."`, `s"..."`) that `type::record()` cannot parse back.
+7. **Transaction result shape change**: SDK v2 returns one array slot per statement, breaking code that used `.find()` to extract results.
+
+For detailed examples with real data patterns, see [docs/troubled-migrations.md](../../docs/troubled-migrations.md).
 
 **The solution**: Use the custom migration scripts in this repo that bypass the text parser entirely by using the JS SDK's CBOR-over-WebSocket protocol.
 
@@ -151,6 +156,60 @@ await db.select(new Table("user"));
 // OR use raw query (still works)
 await db.query("SELECT * FROM user");
 ```
+
+#### RecordId Serialization Mismatch (ridToSurql)
+
+SDK v2's `RecordId.toString()` produces an internal format with type prefixes that `type::record()` cannot parse:
+
+```typescript
+const rid = new RecordId("block", [new RecordId("document", "abc"), "/page/0"]);
+console.log(rid.toString());
+// => block:[ r"document:abc", s"/page/0" ]  <-- INVALID for type::record()
+```
+
+Use `ridToSurql()` from `scripts/rid-to-surql.ts` instead:
+
+```typescript
+import { ridToSurql } from "./rid-to-surql";
+
+ridToSurql(new RecordId("document", "abc123"))
+// => "document:abc123"
+
+ridToSurql(new RecordId("page", "21493df7-786f-8189"))
+// => "page:⟨21493df7-786f-8189⟩"
+
+ridToSurql(new RecordId("block", [new RecordId("document", "abc"), "/page/0/Text/13"]))
+// => "block:[document:abc, '/page/0/Text/13']"  <-- VALID SurrealQL
+```
+
+#### RELATE with Compound IDs (LET Workaround)
+
+`RELATE` does not accept `type::record()` expressions directly. Use `LET` first:
+
+```typescript
+// BROKEN - RELATE rejects type::record() inline
+await db.query(
+    `RELATE type::record($in)->sources_from->type::record($out) SET order = $order`,
+    { in: chunkId, out: blockId, order: 0 }
+);
+
+// FIXED - LET converts string to RecordId, then RELATE uses the variable
+await db.query(
+    `LET $in = type::record($chunkId);
+     LET $out = type::record($blockId);
+     RELATE $in->sources_from->$out SET order = $order`,
+    { chunkId: ridToSurql(chunkRid), blockId: ridToSurql(blockRid), order: 0 }
+);
+```
+
+| Statement | `type::record()` inline | Needs LET workaround |
+|-----------|------------------------|---------------------|
+| `SELECT ... WHERE` | Yes | No |
+| `UPDATE` | Yes | No |
+| `DELETE ... WHERE` | Yes | No |
+| `CREATE CONTENT` | Yes | No |
+| `RELATE $a->edge->$b` | **No** | Yes |
+| `INSERT RELATION $data` | **No** | Yes |
 
 ### Phase 4: Data Migration
 

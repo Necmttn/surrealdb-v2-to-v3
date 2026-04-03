@@ -8,6 +8,7 @@ Tested on a production database: **119,962 records migrated with zero failures**
 
 - **`scripts/surrealdb-migrate.ts`** - Custom SurQL parser + CBOR-over-WebSocket importer with checkpoint/resume
 - **`scripts/surrealdb-restore-sdk.ts`** - SDK-based restore that fixes v2's backslash escaping bug
+- **`scripts/rid-to-surql.ts`** - RecordId-to-SurrealQL serializer (fixes SDK v2's broken `toString()` for compound IDs)
 - **`docs/breaking-changes.md`** - Complete v2-to-v3 breaking changes reference
 - **`docs/playbook.md`** - Step-by-step production migration playbook
 - **`docs/benchmarks.md`** - Real-world migration benchmarks and impact assessment
@@ -76,6 +77,8 @@ The official `surreal export` + `surreal import` roundtrip breaks on:
 
 This toolkit solves all of these by parsing the SurQL export into JS objects and using the SDK's CBOR binary protocol over WebSocket.
 
+See [Troubled Migrations](docs/troubled-migrations.md) for detailed examples with real data patterns showing exactly how each failure manifests and how the custom tools handle them.
+
 ## Claude Code Skill
 
 This repo includes a [Claude Code](https://claude.ai/code) skill for AI-assisted migration.
@@ -103,6 +106,7 @@ The skill provides:
 ## Documentation
 
 - [Breaking Changes Reference](docs/breaking-changes.md) - Every v2-to-v3 breaking change
+- [Troubled Migrations](docs/troubled-migrations.md) - Real failures the native tool can't handle, with concrete examples
 - [Migration Playbook](docs/playbook.md) - Step-by-step production migration guide
 - [Benchmarks](docs/benchmarks.md) - Real-world performance data and impact assessment
 
